@@ -1,0 +1,9 @@
+/data/
+/cache/
+/runs/
+/reproduced/
+/.venv/
+**/__pycache__/
+*.pyc
+*.pt
+.DS_Store
