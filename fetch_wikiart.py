@@ -5,6 +5,7 @@ import os
 import shutil
 from pathlib import Path
 import subprocess
+from tempfile import NamedTemporaryFile
 import zipfile
 
 from PIL import Image, ImageOps
@@ -12,6 +13,8 @@ from PIL import Image, ImageOps
 URL = "https://www.kaggle.com/api/v1/datasets/download/steubk/wikiart?datasetVersionNumber=1"
 SIZE = 33_662_671_673
 TAIL_SIZE = 25_000_000
+IMAGE_SIZE = (64, 64)
+PNG_END = bytes.fromhex("0000000049454e44ae426082")  # IEND chunk with its CRC
 STYLES = ("Abstract_Expressionism", "Color_Field_Painting", "Minimalism")
 
 
@@ -40,6 +43,48 @@ def download(path, start, stop):
     temporary.replace(path)
     print(f"Downloaded {path.name} ({expected:,} bytes)", flush=True)
 
+
+def is_prepared_png(path):
+    """Check both PNG integrity and RGB decoding before reusing a file."""
+    try:
+        with path.open("rb") as stream:
+            # Pillow verifies the image data but can accept a truncated IEND CRC.
+            stream.seek(-len(PNG_END), os.SEEK_END)
+            if stream.read(len(PNG_END)) != PNG_END:
+                return False
+            stream.seek(0)
+            with Image.open(stream) as image:
+                if image.format != "PNG" or image.mode != "RGB" or image.size != IMAGE_SIZE:
+                    return False
+                image.verify()
+            stream.seek(0)
+            with Image.open(stream) as image:
+                image.load()
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+        return False
+    return True
+
+
+def prepare_image(archive, entry, destination):
+    if is_prepared_png(destination):
+        return
+    with archive.open(entry) as raw, Image.open(raw) as image:
+        rgb = ImageOps.exif_transpose(image).convert("RGB")
+        prepared = rgb.resize(IMAGE_SIZE, Image.Resampling.LANCZOS)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with NamedTemporaryFile(
+            dir=destination.parent, prefix=".wikiart-", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            prepared.save(temporary, format="PNG")
+        if not is_prepared_png(temporary_path):
+            raise OSError(f"Invalid prepared PNG for {entry.filename}")
+        temporary_path.replace(destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class RangeFile:
@@ -122,11 +167,7 @@ def main():
         for i, entry in enumerate(selected, 1):
             destination = args.out / entry.filename
             destination = destination.with_suffix(destination.suffix + ".png")
-            if not destination.exists():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(entry) as raw, Image.open(raw) as image:
-                    rgb = ImageOps.exif_transpose(image).convert("RGB")
-                    rgb.resize((64, 64), Image.Resampling.LANCZOS).save(destination)
+            prepare_image(archive, entry, destination)
             if i % 500 == 0 or i == len(selected):
                 print(f"Prepared {i:,}/{len(selected):,} images", flush=True)
 

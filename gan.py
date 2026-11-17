@@ -10,6 +10,7 @@ import time
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from PIL import Image, ImageOps
 import torch
 from torch import nn
@@ -103,26 +104,70 @@ class Paintings(Dataset):
         return x.float().div(127.5).sub(1)
 
 
+def near_duplicate_indices(images):
+    """Find later 64×64 RGB images with mean absolute difference at most 0.35/255."""
+    if len(images) < 2:
+        return set()
+
+    pixels = np.stack(images)
+    count, height, width, channels = pixels.shape
+    limit = int(0.35 * height * width * channels)
+    block_size = 8
+    blocks = pixels.reshape(
+        count, height // block_size, block_size, width // block_size, block_size, channels
+    )
+    block_sums = blocks.sum(axis=(2, 4), dtype=np.int32).reshape(count, -1)
+
+    # Absolute differences of image and block sums bound the full pixel distance below.
+    totals = block_sums.sum(axis=1)
+    order = np.argsort(totals, kind="stable")
+    sorted_totals = totals[order]
+    lower = np.searchsorted(sorted_totals, totals - limit, side="left")
+    upper = np.searchsorted(sorted_totals, totals + limit, side="right")
+
+    duplicates = set()
+    for i, image in enumerate(pixels):
+        candidates = order[lower[i]:upper[i]]
+        earlier = candidates[candidates < i]
+        coarse_distance = np.abs(block_sums[earlier] - block_sums[i]).sum(axis=1)
+        rgb = image.astype(np.int16)
+        # Check previously discarded images too, since they may have near duplicates of their own.
+        for j in earlier[coarse_distance <= limit]:
+            if np.abs(rgb - pixels[j]).sum() <= limit:
+                duplicates.add(i)
+                break
+    return duplicates
+
+
 def make_split(root, holdout, seed, max_train):
     rng = random.Random(seed)
-    sources = {}
+    entries = []
+    images = []
     seen = set()
     duplicates = 0
     for style in STYLES:
-        files = []
         for path in sorted((root / style).rglob("*")):
             if path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
                 continue
-            digest = hashlib.sha256(read_image(path).tobytes()).digest()
+            image = read_image(path)
+            raw = image.tobytes()
+            digest = hashlib.sha256(raw).digest()
             if digest in seen:
                 duplicates += 1
             else:
                 seen.add(digest)
-                files.append(path.relative_to(root).as_posix())
+                entries.append((style, path.relative_to(root).as_posix()))
+                images.append(np.frombuffer(raw, dtype=np.uint8).reshape(IMAGE_SIZE, IMAGE_SIZE, 3))
+
+    near_duplicates = near_duplicate_indices(images)
+    sources = {style: [] for style in STYLES}
+    for i, (style, file) in enumerate(entries):
+        if i not in near_duplicates:
+            sources[style].append(file)
+    for style, files in sources.items():
         if not files:
-            raise ValueError(f"No images for {style} in {root}")
+            raise ValueError(f"No unique images for {style} in {root} after deduplication.")
         rng.shuffle(files)
-        sources[style] = files
     total = sum(len(files) for files in sources.values())
     if not 2 <= holdout < total:
         raise ValueError(f"Holdout size must be between 2 and {total - 1}.")
@@ -140,7 +185,10 @@ def make_split(root, holdout, seed, max_train):
     rng.shuffle(test)
     if max_train:
         train = train[:max_train]
-    return {"train": train, "holdout": test, "exact_duplicates_removed": duplicates}
+    return {
+        "train": train, "holdout": test, "exact_duplicates_removed": duplicates,
+        "near_duplicates_removed": len(near_duplicates),
+    }
 
 
 @torch.inference_mode()
@@ -195,6 +243,7 @@ def main():
         "device": str(device), "image_size": IMAGE_SIZE, "train_images": len(split["train"]),
         "holdout_images": len(split["holdout"]), "styles": list(STYLES),
         "exact_duplicates_removed": split["exact_duplicates_removed"],
+        "near_duplicates_removed": split["near_duplicates_removed"],
         "upsampling": args.upsampling,
     }
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")

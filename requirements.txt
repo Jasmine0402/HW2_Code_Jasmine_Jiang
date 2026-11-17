@@ -4,3 +4,4 @@ pytorch-ignite
 scipy
 matplotlib
 Pillow
+numpy
